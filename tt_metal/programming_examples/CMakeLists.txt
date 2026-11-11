@@ -31,6 +31,7 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/sfpu_eltwise_chain)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/custom_sfpi_add)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/custom_sfpi_smoothstep)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/long_matmul)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bitnet_simple)
 
 add_custom_target(
     programming_examples
@@ -56,6 +57,7 @@ install(
         custom_sfpi_add
         custom_sfpi_smoothstep
         long_matmul
+        bitnet_simple
         tests
     # DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples
     # FIXME(afuller): Something funky is happening when installing files into
