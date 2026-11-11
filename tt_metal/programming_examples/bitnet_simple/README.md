@@ -1,12 +1,23 @@
-# BitNet Simple - Ternary Unpack Kernel Demo
+# BitNet Simple - Ternary Unpack Kernel Demo (Prototype)
 
-Minimal example demonstrating ternary quantization unpacking on Tenstorrent hardware.
+**Status**: Teaching/Demonstration Example
+
+This is a **prototype/skeleton** demonstrating the structure of a TT-Metal application for ternary quantization. The compute kernel is a placeholder and does not perform actual ternary unpacking (see "Known Limitations" below).
 
 ## What this demo does
 
-This example implements a ternary unpacking operation for BitNet-style quantization:
-- Input: Ternary values {-1, 0, +1} packed in 2 bits (4 trits per byte)
-- Output: Unpacked float16 values
+This example demonstrates the TT-Metal programming model structure:
+
+### Working Components
+- ✅ **Host Application**: Set up devices, kernels, circular buffers
+- ✅ **Dataflow Kernels**: DRAM ↔ L1 data transfer (reader/writer)
+- ✅ **Mock Cluster Simulator**: JIT kernel compilation works correctly
+- ✅ **Validation Infrastructure**: Host-side reference implementation
+
+### Placeholder Component
+- ⏸️ **Compute Kernel**: Currently just copies data without unpacking (see ternary_unpack.cpp)
+
+**End-to-end test** will fail with mismatched results until actual SFPU unpacking is implemented.
 
 ## Directory Structure
 
@@ -200,15 +211,70 @@ Decoding:
 | `ternary_unpack.cpp` | Decode 2-bit trits to float | `extract bits`, `decode to float16` |
 | `write_unpacked.cpp` | Write result back to DRAM | `noc_async_write_page`, `cb_pop_front` |
 
+## Known Limitations
+
+This is a **teaching example** that demonstrates TT-Metal API usage, but has the following limitations:
+
+1. **No Actual Unpacking**: The compute kernel (`ternary_unpack.cpp`) is a placeholder that simply copies data. Real implementation would:
+   - Extract 2 bits from packed uint8_t
+   - Decode to ternary values: 00→-1, 01→0, 10→0, 11→+1
+   - Convert to float16/bfloat16 format
+
+2. **No SFPU Vectorization**: Production implementation should use SFPU (Single-Instruction Multiple-Data Floating Point Unit) operations:
+   ```cpp
+   #include "experimental/llk_sfpu/ckernel_sfpu_custom_ternary_unpack.h"
+   // Custom SFPU implementation needed
+   ```
+
+3. **Test Will Fail**: The end-to-end test reports mismatches because data is not actually unpacked. This is **expected behavior** for this prototype.
+
+4. **Single Core Only**: Uses only core {0, 0}. Production would distribute work across multiple Tensix cores.
+
+## What This Example Demonstrates
+
+Despite limitations, this example shows:
+
+✓ TT-Metal application structure
+✓ Dataflow kernel patterns (reader/writer)
+✓ Circular buffer configuration (different data formats)
+✓ Kernel compilation with RISC-V compiler (JIT)
+✓ Mock cluster simulator usage
+✓ TensorAccessorArgs for buffer addressing
+✓ Host-side validation infrastructure
+✓ Tile-based data flow (32×32 tiles)
+
 ## Future Enhancements
 
-This is a minimal skeleton. Production optimizations would include:
+For a production-ready BitNet implementation:
 
-1. **Vectorized Unpacking**: Use SFPU instructions for parallel processing
-2. **Fused Operations**: Combine unpacking with downstream operations (accumulate)
-3. **Multi-Core Scaling**: Distribute work across multiple Tensix cores
-4. **Sparse Optimization**: Skip zero values during unpacking
-5. **Custom Data Format**: Support alternative ternary encodings
+### 1. SFPU Unpacking (Required)
+```cpp
+// In tt_metal/experimental/llk_sfpu/:
+// Add: ckernel_sfpu_custom_ternary_unpack.h
+
+inline void unpack_ternary_tile(uint32_t dst) {
+    // Load 32-bit words (16 trits each)
+    // Extract 2 bits per trit
+    // Decode: 00→-1, 01/10→0, 11→+1
+    // Scale to float16 range
+    // Store to destination tile
+}
+```
+
+### 2. Multi-Core Scaling
+```cpp
+auto cores = corerange.x_size() * corerange.y_size();
+split_work_to_cores(cores, num_tiles, work_per_core);
+// Distribute tile processing across multiple Tensix cores
+```
+
+### 3. Fused Operations
+- Combine unpacking with accumulation matrix multiplication
+- Skip DRAM round-trip for intermediate results
+
+### 4. Sparse Optimization
+- Detect zero-run patterns (75% typical in BitNet weights)
+- Skip computation for zero tiles
 
 ## Troubleshooting
 
