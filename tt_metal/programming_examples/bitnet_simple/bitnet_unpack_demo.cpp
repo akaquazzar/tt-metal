@@ -142,13 +142,12 @@ int main() {
         std::cout << "BitNet Ternary Unpack Kernel Demo" << std::endl;
         std::cout << "========================================" << std::endl << std::endl;
 
-        // Конфигурация: 1 входной тайл UInt32 (1024 слова) = 16 384 трита = 16 выходных тайлов Int8
         constexpr uint32_t TILE_SIZE = tt::constants::TILE_WIDTH * tt::constants::TILE_HEIGHT;  // 1024
         constexpr uint32_t TRITS_PER_WORD = 16;
         constexpr uint32_t NUM_IN_TILES = 1;
         constexpr uint32_t NUM_OUT_TILES = NUM_IN_TILES * TRITS_PER_WORD;          // 16
         constexpr uint32_t NUM_TRITS = NUM_IN_TILES * TILE_SIZE * TRITS_PER_WORD;  // 16 384
-        const std::string test_pattern = "alternating";
+        const std::string test_pattern = "balanced";
 
         std::cout << "Test Configuration:" << std::endl;
         std::cout << "  - Input tiles (UInt32):  " << NUM_IN_TILES << std::endl;
@@ -156,13 +155,11 @@ int main() {
         std::cout << "  - Total trits:           " << NUM_TRITS << std::endl;
         std::cout << "  - Test pattern:          " << test_pattern << std::endl << std::endl;
 
-        // Генерация входных данных
         std::cout << "Generating test data..." << std::endl;
         std::vector<uint32_t> packed_input = generate_test_data(NUM_TRITS, test_pattern);
         std::cout << "  Packed words (uint32_t): " << packed_input.size() << std::endl;
         std::cout << "  Packed bytes:            " << packed_input.size() * sizeof(uint32_t) << std::endl;
 
-        // Эталонный результат на хосте (с учетом страйдов по выходным тайлам)
         std::vector<int8_t> host_reference = unpack_ternary_host(packed_input, NUM_IN_TILES);
 
         std::vector<int8_t> first_32(
@@ -185,13 +182,11 @@ int main() {
         std::cout << "  Grid size:           " << core_grid.x << " x " << core_grid.y << std::endl;
         std::cout << "  Using core:          {" << core.x << ", " << core.y << "}" << std::endl << std::endl;
 
-        // Размеры буферов
         constexpr uint32_t in_tiles_per_cb = 2;
         constexpr uint32_t out_tiles_per_cb = 16;  // Вмещает все 16 выходных тайлов без блокировки
         constexpr uint32_t packed_tile_size = TILE_SIZE * sizeof(uint32_t);  // 4096 байт
         constexpr uint32_t unpacked_tile_size = TILE_SIZE * sizeof(int8_t);  // 1024 байта
 
-        // Входной DRAM буфер (UInt32)
         const uint32_t packed_size_bytes = NUM_IN_TILES * packed_tile_size;
         distributed::DeviceLocalBufferConfig packed_dram_config{
             .page_size = packed_tile_size, .buffer_type = BufferType::DRAM};
@@ -199,7 +194,6 @@ int main() {
         auto src_packed_buffer =
             distributed::MeshBuffer::create(packed_buffer_config, packed_dram_config, mesh_device.get());
 
-        // Выходной DRAM буфер (Int8)
         const uint32_t unpacked_size_bytes = NUM_OUT_TILES * unpacked_tile_size;
         distributed::DeviceLocalBufferConfig unpacked_dram_config{
             .page_size = unpacked_tile_size, .buffer_type = BufferType::DRAM};
@@ -225,7 +219,6 @@ int main() {
                 out_tiles_per_cb * unpacked_tile_size, {{static_cast<uint8_t>(dst_cb_index), tt::DataFormat::Int8}})
                 .set_page_size(dst_cb_index, unpacked_tile_size));
 
-        // Создание ядер
         std::cout << "Creating kernels..." << std::endl;
         std::vector<uint32_t> reader_compile_time_args;
         TensorAccessorArgs(*src_packed_buffer).append_to(reader_compile_time_args);
