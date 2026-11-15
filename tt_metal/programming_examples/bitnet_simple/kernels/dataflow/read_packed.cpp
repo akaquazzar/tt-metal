@@ -23,4 +23,6 @@ void kernel_main() {
 
         cb_push_back(cb_in, 1);
     }
+
+    DEVICE_PRINT("=== Exit from READ ===\n");
 }

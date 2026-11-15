@@ -2,6 +2,7 @@
 #include "api/compute/common.h"
 #include "api/compute/tile_move_copy.h"
 #include "api/compute/compute_kernel_api.h"
+#include "api/debug/dprint.h"
 
 #ifdef TRISC_MATH
 #include "experimental/llk_sfpu/ckernel_sfpu_custom_ternary_unpack.h"
@@ -51,5 +52,6 @@ void kernel_main() {
         }
 
         cb_pop_front(cb_in, 1);
+        DEVICE_PRINT("=== Exit from UNPACK ===\n");
     }
 }

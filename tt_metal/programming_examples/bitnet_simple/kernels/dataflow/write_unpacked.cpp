@@ -1,5 +1,6 @@
 #include <cstdint>
 #include "api/dataflow/dataflow_api.h"
+#include "api/debug/device_print.h"
 
 void kernel_main() {
     const uint32_t dst_addr = get_arg_val<uint32_t>(0);
@@ -7,7 +8,7 @@ void kernel_main() {
 
     constexpr uint32_t cb_out = tt::CBIndex::c_16;
     constexpr uint32_t tile_bytes = 1024;
-    const uint32_t total_out_tiles = n_in_tiles * 16;
+    const uint32_t total_out_tiles = 16;
 
     const InterleavedAddrGenFast<true> dst_gen = {
         .bank_base_address = dst_addr,
@@ -15,13 +16,24 @@ void kernel_main() {
         .data_format = DataFormat::Int8
     };
 
+    DEVICE_PRINT("=== First 32 elements in cb_out (Int8) total_out_tiles: {} ===\n", total_out_tiles);
+
     for (uint32_t i = 0; i < total_out_tiles; ++i) {
         cb_wait_front(cb_out, 1);
         uint32_t l1_read_addr = get_read_ptr(cb_out);
+
+        // Печатаем первые 32 элемента первого выходного тайла
+        if (i == 15) {
+            volatile int8_t* ptr = reinterpret_cast<volatile int8_t*>(l1_read_addr);
+            for (uint32_t idx = 0; idx < 32; ++idx) {
+                DEVICE_PRINT("i: {} elem {}: val = {}\n", i, idx, static_cast<int32_t>(ptr[idx]));
+            }
+        }
 
         noc_async_write_tile(i, dst_gen, l1_read_addr);
         noc_async_write_barrier();
 
         cb_pop_front(cb_out, 1);
     }
+    DEVICE_PRINT("=== Exit from WRITE ===\n");
 }
