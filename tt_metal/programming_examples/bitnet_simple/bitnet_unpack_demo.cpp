@@ -21,13 +21,6 @@ using namespace tt::tt_metal;
 #define OVERRIDE_KERNEL_PREFIX ""
 #endif
 
-/**
- * Кодировка тритов (строго согласована с формулой plus_one - minus_one в SFPU):
- *   00 (0x0) ->  0
- *   01 (0x1) -> +1
- *   10 (0x2) -> -1
- *   11 (0x3) ->  0 (не используется)
- */
 constexpr int8_t decode_trit_u32(uint32_t packed_word, uint32_t trit_idx) {
     constexpr uint32_t TERNARY_MASK = 0x3;
     uint32_t bits = (packed_word >> (trit_idx * 2)) & TERNARY_MASK;
@@ -40,10 +33,6 @@ constexpr int8_t decode_trit_u32(uint32_t packed_word, uint32_t trit_idx) {
     }
 }
 
-/**
- * Эталонная распаковка на хосте с учетом страйдовой геометрии SFPU-ядра:
- * k-й трит (0..15) из слова elem_idx (0..1023) попадает в k-й выходной тайл на позицию elem_idx.
- */
 std::vector<int8_t> unpack_ternary_host(const std::vector<uint32_t>& packed, uint32_t num_in_tiles) {
     constexpr uint32_t TILE_SIZE = 1024;
     constexpr uint32_t TRITS_PER_WORD = 16;
@@ -70,9 +59,6 @@ std::vector<int8_t> unpack_ternary_host(const std::vector<uint32_t>& packed, uin
     return unpacked;
 }
 
-/**
- * Генерация тестовых данных и упаковка по 16 тритов в одно 32-битное слово (uint32_t)
- */
 std::vector<uint32_t> generate_test_data(uint32_t num_trits, const std::string& pattern) {
     std::vector<uint32_t> packed((num_trits + 15) / 16, 0);
 
@@ -96,7 +82,6 @@ std::vector<uint32_t> generate_test_data(uint32_t num_trits, const std::string& 
         uint32_t word_idx = i / 16;
         uint32_t trit_idx = i % 16;
 
-        // Кодируем в биты под SFPU (01 -> +1, 10 -> -1, 00 -> 0)
         uint32_t bits = 0x0;
         if (value > 0) {
             bits = 0x1;  // 01 -> +1
@@ -110,9 +95,7 @@ std::vector<uint32_t> generate_test_data(uint32_t num_trits, const std::string& 
     return packed;
 }
 
-/**
- * Вывод тернарных значений в читаемом виде
- */
+
 void print_ternary_data(const std::vector<int8_t>& data, const std::string& label, uint32_t max_print = 64) {
     std::cout << label << ": [";
     size_t limit = std::min(data.size(), static_cast<size_t>(max_print));
@@ -167,7 +150,6 @@ int main() {
         print_ternary_data(first_32, "  First 32 trits (Host Tile 0)");
         std::cout << std::endl;
 
-        // Инициализация устройства (симулятора)
         std::cout << "Creating device..." << std::endl;
         constexpr int device_id = 0;
         auto mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
@@ -246,7 +228,7 @@ int main() {
             OVERRIDE_KERNEL_PREFIX "bitnet_simple/kernels/compute/ternary_unpack.cpp",
             core,
             ComputeConfig{.fp32_dest_acc_en = true, .dst_full_sync_en = true});
-        // Загрузка данных и аргументов
+
         std::cout << "Uploading input data to device..." << std::endl;
         distributed::EnqueueWriteMeshBuffer(cq, src_packed_buffer, packed_input, false);
         SetRuntimeArgs(program, reader, core, {src_packed_buffer->address(), NUM_IN_TILES});
@@ -257,7 +239,7 @@ int main() {
         workload.add_program(device_range, std::move(program));
         distributed::EnqueueMeshWorkload(cq, workload, false);
         distributed::Finish(cq);
-        // Чтение результатов обратно на хост
+
         std::cout << "Reading results from device..." << std::endl;
         std::vector<int8_t> device_result;
         distributed::EnqueueReadMeshBuffer(cq, device_result, dst_unpacked_buffer, true);
@@ -265,7 +247,6 @@ int main() {
             device_result.begin(), std::min(device_result.begin() + 32, device_result.end()));
         print_ternary_data(dev_first_32, "  First 32 trits (Device Tile 0)");
         std::cout << std::endl;
-        // Строгая побайтовая проверка всех элементов
         std::cout << "Validating device results against host reference..." << std::endl;
         if (device_result.size() != host_reference.size()) {
             std::cerr << "FAIL: Size mismatch! Expected " << host_reference.size() << ", got " << device_result.size()
