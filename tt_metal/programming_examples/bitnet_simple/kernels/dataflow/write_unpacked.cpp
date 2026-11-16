@@ -21,4 +21,5 @@ void kernel_main() {
 
         cb_pop_front(cb_out, 1);
     }
+    DEVICE_PRINT("=== Exit from WRITE ===\n");
 }

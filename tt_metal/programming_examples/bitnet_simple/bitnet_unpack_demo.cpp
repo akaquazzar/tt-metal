@@ -127,9 +127,9 @@ int main() {
 
         constexpr uint32_t TILE_SIZE = tt::constants::TILE_WIDTH * tt::constants::TILE_HEIGHT;  // 1024
         constexpr uint32_t TRITS_PER_WORD = 16;
-        constexpr uint32_t NUM_IN_TILES = 1;
+        constexpr uint32_t NUM_IN_TILES = 16;
         constexpr uint32_t NUM_OUT_TILES = NUM_IN_TILES * TRITS_PER_WORD;          // 16
-        constexpr uint32_t NUM_TRITS = NUM_IN_TILES * TILE_SIZE * TRITS_PER_WORD;  // 16 384
+        constexpr uint32_t NUM_TRITS = NUM_IN_TILES * TILE_SIZE * TRITS_PER_WORD;
         const std::string test_pattern = "balanced";
 
         std::cout << "Test Configuration:" << std::endl;
