@@ -31,7 +31,8 @@ for (uint32_t i = 0; i < count; ++i) {
     uint32_t k = start_k + i;
     sfpi::vInt plus_one  = (packed >> (k * 2)) & 0x01;
     sfpi::vInt minus_one = (packed >> (k * 2 + 1)) & 0x01;
-    sfpi::dst_reg[(i + 1) * 32 + row_idx] = plus_one - minus_one;
+    sfpi::vInt diff = plus_one - minus_one;
+    sfpi::dst_reg[(i + 1) * 32 + row_idx] = (diff & 0x80000001);
 }
 }
 
