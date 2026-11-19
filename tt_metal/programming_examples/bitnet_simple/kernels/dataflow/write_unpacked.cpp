@@ -5,6 +5,8 @@ void kernel_main() {
     const uint32_t out_addr        = get_arg_val<uint32_t>(0);
     const uint32_t total_out_tiles = get_arg_val<uint32_t>(1); // M_tiles * N_tiles
 
+    DEVICE_PRINT("+++kernel_main total_out_tiles: {}\n", total_out_tiles);
+
     constexpr uint32_t cb_out = tt::CBIndex::c_16;
     constexpr uint32_t out_tile_bytes = 4096;
 
@@ -20,4 +22,5 @@ void kernel_main() {
 
         cb_pop_front(cb_out, 1);
     }
+    DEVICE_PRINT("---kernel_main\n");
 }

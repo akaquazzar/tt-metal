@@ -29,19 +29,17 @@ void kernel_main() {
 
     for (uint32_t m = 0; m < M_tiles; ++m) {
         for (uint32_t n = 0; n < N_tiles; ++n) {
-            // Захватываем DST на ВСЮ глубину K_tiles, чтобы DST накапливал сумму по всем kb
-            tile_regs_acquire();
+            // 1. Сначала распаковываем ВСЕ блоки весов по глубине K для столбца (m, n) в cb_unpacked
+            reconfig_data_format(cb_packed, cb_packed);
+            pack_reconfig_data_format(cb_unpacked);
+            copy_init(cb_packed);
 
             for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
-                // 1. Распаковываем очередной блок из 16 тайлов весов в cb_unpacked
-                reconfig_data_format_srca(cb_packed);
-                pack_reconfig_data_format(cb_unpacked);
-                copy_init(cb_packed);
-
                 cb_wait_front(cb_packed, 1);
 
                 for (uint32_t b = 0; b < 4; ++b) {
                     const uint32_t start_k = batch_starts[b];
+                    tile_regs_acquire();
                     copy_tile(cb_packed, 0, 0);
 
                     MATH(
@@ -50,37 +48,43 @@ void kernel_main() {
                         }
                     );
 
+                    tile_regs_commit();
+                    tile_regs_wait();
+
                     cb_reserve_back(cb_unpacked, batch_size);
                     for (uint32_t i = 0; i < batch_size; ++i) {
                         pack_tile(i + 1, cb_unpacked);
                     }
                     cb_push_back(cb_unpacked, batch_size);
+
+                    tile_regs_release();
                 }
 
                 cb_pop_front(cb_packed, 1);
-
-                // 2. Перемножаем 16 тайлов активаций на 16 распакованных весов с накоплением в DST
-                reconfig_data_format(cb_act, cb_unpacked);
-                matmul_init(cb_act, cb_unpacked);
-
-                for (uint32_t k_off = 0; k_off < trits_per_word; k_off += batch_size) {
-                    cb_wait_front(cb_act, batch_size);
-                    cb_wait_front(cb_unpacked, batch_size);
-
-                    for (uint32_t i = 0; i < batch_size; ++i) {
-                        matmul_tiles(cb_act, cb_unpacked, i, i, acc_dst_idx);
-                    }
-
-                    cb_pop_front(cb_act, batch_size);
-                    cb_pop_front(cb_unpacked, batch_size);
-                }
             }
 
-            // 3. Фиксируем и записываем готовый тайл C(m, n) после прохода по всей глубине K
+            // 2. Теперь ОДИН РАЗ инициализируем Matmul и накапливаем всю глубину K_tiles в DST!
+            reconfig_data_format(cb_act, cb_unpacked);
+            pack_reconfig_data_format(cb_out);
+            matmul_init(cb_act, cb_unpacked);
+
+            tile_regs_acquire();
+
+            for (uint32_t k = 0; k < K_tiles; k += batch_size) {
+                cb_wait_front(cb_act, batch_size);
+                cb_wait_front(cb_unpacked, batch_size);
+
+                for (uint32_t i = 0; i < batch_size; ++i) {
+                    matmul_tiles(cb_act, cb_unpacked, i, i, acc_dst_idx);
+                }
+
+                cb_pop_front(cb_act, batch_size);
+                cb_pop_front(cb_unpacked, batch_size);
+            }
+
             tile_regs_commit();
             tile_regs_wait();
 
-            pack_reconfig_data_format(cb_out);
             cb_reserve_back(cb_out, 1);
             pack_tile(acc_dst_idx, cb_out);
             cb_push_back(cb_out, 1);
@@ -89,3 +93,5 @@ void kernel_main() {
         }
     }
 }
+
+

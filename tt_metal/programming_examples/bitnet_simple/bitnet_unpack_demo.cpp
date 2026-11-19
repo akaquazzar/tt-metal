@@ -259,7 +259,7 @@ int main() {
         CreateCircularBuffer(
             program,
             core,
-            CircularBufferConfig(16 * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
+            CircularBufferConfig(K_TILES * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
                 .set_page_size(tt::CBIndex::c_2, int8_tile_size));
 
         CreateCircularBuffer(
@@ -322,26 +322,35 @@ int main() {
         std::cout << "Reading results from device..." << std::endl;
         std::vector<int32_t> device_result;
         distributed::EnqueueReadMeshBuffer(cq, device_result, dst_out_buffer, true);
+        auto tensix_sm_to_int32 = [](int32_t raw_val) -> int32_t {
+            uint32_t u = static_cast<uint32_t>(raw_val);
+            int32_t mag = static_cast<int32_t>(u & 0x7FFFFFFFu);
+            return (u & 0x80000000u) ? -mag : mag;
+        };
+
         std::cout << "Validating device results against host reference..." << std::endl;
         if (device_result.size() != host_matmul_ref.size()) {
             std::cerr << "FAIL: Size mismatch! Expected " << host_matmul_ref.size() << ", got " << device_result.size()
                       << std::endl;
             pass = false;
-        } else if (device_result != host_matmul_ref) {
-            std::cerr << "FAIL: Data mismatch!" << std::endl;
-            pass = false;
+        } else {
             uint32_t errors_printed = 0;
             for (size_t i = 0; i < host_matmul_ref.size(); ++i) {
-                if (device_result[i] != host_matmul_ref[i]) {
-                    std::cerr << "  Mismatch at index " << i << " (Out Tile " << (i / TILE_SIZE) << ", Elem "
-                              << (i % TILE_SIZE) << "): expected " << host_matmul_ref[i] << ", got " << device_result[i]
-                              << std::endl;
-                    if (++errors_printed >= 10) {
-                        break;
+                int32_t actual = tensix_sm_to_int32(device_result[i]);
+                if (actual != host_matmul_ref[i]) {
+                    if (pass) {
+                        std::cerr << "FAIL: Data mismatch!" << std::endl;
+                        pass = false;
+                    }
+                    if (errors_printed < 33) {
+                        std::cerr << "  Mismatch at index " << i << " (Elem " << i << "): "
+                                  << "expected " << host_matmul_ref[i] << ", got " << actual << std::endl;
+                        ++errors_printed;
                     }
                 }
             }
         }
+
         if (pass) {
             std::cout << "PASS! Arbitrary (M=" << M_TILES << ", K=" << K_TILES << ", N=" << N_TILES
                       << ") BitNet Matmul verified across all " << NUM_OUT_TILES << " output tiles!" << std::endl;
