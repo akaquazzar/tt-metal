@@ -10,7 +10,7 @@
 
 void kernel_main() {
     const uint32_t M_tiles = get_arg_val<uint32_t>(0);
-    const uint32_t K_tiles = get_arg_val<uint32_t>(1); // Кратно 16
+    const uint32_t K_tiles = get_arg_val<uint32_t>(1);
     const uint32_t N_tiles = get_arg_val<uint32_t>(2);
 
     constexpr uint32_t cb_packed   = tt::CBIndex::c_0;
@@ -24,62 +24,66 @@ void kernel_main() {
     constexpr uint32_t acc_dst_idx = 5;
 
     const uint32_t num_k_blocks = K_tiles / trits_per_word;
+    const uint32_t total_weight_blocks = N_tiles * num_k_blocks;
 
+    // =========================================================================
+    // ПРОХОД 1: Распаковываем ВСЕ веса (N_tiles * K_tiles) в cb_unpacked
+    // Здесь работает ТОЛЬКО copy_init — ни одного matmul_init ещё не было!
+    // =========================================================================
     compute_kernel_hw_startup(cb_packed, cb_unpacked);
+    copy_init(cb_packed);
 
-    for (uint32_t m = 0; m < M_tiles; ++m) {
-        for (uint32_t n = 0; n < N_tiles; ++n) {
-            // 1. Сначала распаковываем ВСЕ блоки весов по глубине K для столбца (m, n) в cb_unpacked
-            reconfig_data_format(cb_packed, cb_packed);
-            pack_reconfig_data_format(cb_unpacked);
-            copy_init(cb_packed);
+    for (uint32_t wb = 0; wb < total_weight_blocks; ++wb) {
+        cb_wait_front(cb_packed, 1);
 
-            for (uint32_t kb = 0; kb < num_k_blocks; ++kb) {
-                cb_wait_front(cb_packed, 1);
+        for (uint32_t b = 0; b < 4; ++b) {
+            const uint32_t start_k = batch_starts[b];
+            tile_regs_acquire();
+            copy_tile(cb_packed, 0, 0);
 
-                for (uint32_t b = 0; b < 4; ++b) {
-                    const uint32_t start_k = batch_starts[b];
-                    tile_regs_acquire();
-                    copy_tile(cb_packed, 0, 0);
-
-                    MATH(
-                        for (uint32_t row = 0; row < 32; ++row) {
-                            ckernel::sfpu::unpack_row_batch(row, start_k, batch_size);
-                        }
-                    );
-
-                    tile_regs_commit();
-                    tile_regs_wait();
-
-                    cb_reserve_back(cb_unpacked, batch_size);
-                    for (uint32_t i = 0; i < batch_size; ++i) {
-                        pack_tile(i + 1, cb_unpacked);
-                    }
-                    cb_push_back(cb_unpacked, batch_size);
-
-                    tile_regs_release();
+            MATH(
+                for (uint32_t row = 0; row < 32; ++row) {
+                    ckernel::sfpu::unpack_row_batch(row, start_k, batch_size);
                 }
+            );
 
-                cb_pop_front(cb_packed, 1);
+            tile_regs_commit();
+            tile_regs_wait();
+
+            cb_reserve_back(cb_unpacked, batch_size);
+            for (uint32_t i = 0; i < batch_size; ++i) {
+                pack_tile(i + 1, cb_unpacked);
             }
+            cb_push_back(cb_unpacked, batch_size);
 
-            // 2. Теперь ОДИН РАЗ инициализируем Matmul и накапливаем всю глубину K_tiles в DST!
-            reconfig_data_format(cb_act, cb_unpacked);
-            pack_reconfig_data_format(cb_out);
-            matmul_init(cb_act, cb_unpacked);
+            tile_regs_release();
+        }
 
+        cb_pop_front(cb_packed, 1);
+    }
+
+    // =========================================================================
+    // ПРОХОД 2: Переключаемся в Matmul ОДИН РАЗ и читаем cb_unpacked всегда с индекса 0!
+    // =========================================================================
+    reconfig_data_format(cb_act, cb_unpacked);
+    pack_reconfig_data_format(cb_out);
+    matmul_init(cb_act, cb_unpacked);
+
+    for (uint32_t n = 0; n < N_tiles; ++n) {
+        cb_wait_front(cb_unpacked, K_tiles);
+
+        for (uint32_t m = 0; m < M_tiles; ++m) {
             tile_regs_acquire();
 
             for (uint32_t k = 0; k < K_tiles; k += batch_size) {
                 cb_wait_front(cb_act, batch_size);
-                cb_wait_front(cb_unpacked, batch_size);
 
                 for (uint32_t i = 0; i < batch_size; ++i) {
-                    matmul_tiles(cb_act, cb_unpacked, i, i, acc_dst_idx);
+                    // Читаем cb_unpacked с нулевой базы (k + i = 0..31)
+                    matmul_tiles(cb_act, cb_unpacked, i, k + i, acc_dst_idx);
                 }
 
                 cb_pop_front(cb_act, batch_size);
-                cb_pop_front(cb_unpacked, batch_size);
             }
 
             tile_regs_commit();
@@ -91,7 +95,7 @@ void kernel_main() {
 
             tile_regs_release();
         }
+
+        cb_pop_front(cb_unpacked, K_tiles);
     }
 }
-
-

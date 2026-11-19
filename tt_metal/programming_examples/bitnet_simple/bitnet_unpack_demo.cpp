@@ -70,7 +70,6 @@ std::vector<uint32_t> generate_test_data(uint32_t num_trits, const std::string& 
             int rand_val = rand() % 3;
             value = (rand_val == 0) ? -1 : (rand_val == 1) ? 0 : 1;
         } else if (pattern == "alternating") {
-            // Паттерн: -1, 0, +1, 0, -1, 0, +1, 0...
             value = (i % 4 == 0) ? -1 : (i % 4 == 1) ? 0 : (i % 4 == 2) ? 1 : 0;
         } else if (pattern == "all_zeros") {
             value = 0;
@@ -115,8 +114,6 @@ void print_ternary_data(const std::vector<int8_t>& data, const std::string& labe
     std::cout << "]" << std::endl;
 }
 
-// Вспомогательная функция на хосте: перемножение двух тайлов 32x32 (A и B),
-// хранящихся в формате фейсов Tenstorrent (4 фейса 16x16), с накоплением в acc (Int32)
 static void matmul_tilized_int8_accumulate(
     const int8_t* tile_a, const int8_t* tile_b, std::vector<int32_t>& acc_tile, size_t acc_offset) {
     auto get_tilized_elem = [](const int8_t* tile, uint32_t r, uint32_t c) -> int32_t {
@@ -146,7 +143,6 @@ int main() {
         std::cout << "BitNet Arbitrary (M, K, N) Fused Matmul" << std::endl;
         std::cout << "========================================" << std::endl << std::endl;
 
-        // Произвольные размеры матриц в тайлах 32x32:
         // C[M_tiles x N_tiles] = A[M_tiles x K_tiles] * B[K_tiles x N_tiles]
         constexpr uint32_t TILE_SIZE = tt::constants::TILE_WIDTH * tt::constants::TILE_HEIGHT;  // 1024
         constexpr uint32_t TRITS_PER_WORD = 16;
@@ -173,7 +169,6 @@ int main() {
         std::cout << "  - Packed Weights (UInt32):     " << NUM_PACKED_WEIGHT_TILES << " tiles" << std::endl;
         std::cout << "  - Output Matrix C (Int32):     " << NUM_OUT_TILES << " tiles" << std::endl << std::endl;
 
-        // 1. Генерация входных данных
         std::cout << "Generating test data..." << std::endl;
         // Сжатые веса хранятся в порядке [n * NUM_K_BLOCKS + kb]
         std::vector<uint32_t> packed_weights = generate_test_data(TOTAL_TRITS, test_pattern);
@@ -188,7 +183,6 @@ int main() {
             }
         }
 
-        // 2. Эталонный расчёт на хосте
         std::vector<int8_t> unpacked_weights_ref = unpack_ternary_host(packed_weights, NUM_PACKED_WEIGHT_TILES);
         std::vector<int32_t> host_matmul_ref(NUM_OUT_TILES * TILE_SIZE, 0);
 
@@ -209,7 +203,6 @@ int main() {
             }
         }
 
-        // 3. Инициализация устройства
         std::cout << "Creating device..." << std::endl;
         constexpr int device_id = 0;
         auto mesh_device = distributed::MeshDevice::create_unit_mesh(device_id);
@@ -255,11 +248,10 @@ int main() {
             CircularBufferConfig(8 * int8_tile_size, {{tt::CBIndex::c_1, tt::DataFormat::Int8}})
                 .set_page_size(tt::CBIndex::c_1, int8_tile_size));
 
-        // 16 тайлов в c_2 для хранения одного распакованного блока K=16
         CreateCircularBuffer(
             program,
             core,
-            CircularBufferConfig(K_TILES * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
+            CircularBufferConfig(N_TILES * K_TILES * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
                 .set_page_size(tt::CBIndex::c_2, int8_tile_size));
 
         CreateCircularBuffer(
@@ -268,7 +260,6 @@ int main() {
             CircularBufferConfig(2 * int32_tile_size, {{tt::CBIndex::c_16, tt::DataFormat::Int32}})
                 .set_page_size(tt::CBIndex::c_16, int32_tile_size));
 
-        // 6. Создание ядер
         std::cout << "Creating kernels..." << std::endl;
         std::vector<uint32_t> reader_compile_time_args;
         TensorAccessorArgs(*src_packed_buffer).append_to(reader_compile_time_args);
@@ -312,13 +303,11 @@ int main() {
             core,
             {src_packed_buffer->address(), src_act_buffer->address(), M_TILES, K_TILES, N_TILES});
         SetRuntimeArgs(program, compute, core, {M_TILES, K_TILES, N_TILES});
-        SetRuntimeArgs(program, writer, core, {dst_out_buffer->address(), NUM_OUT_TILES});
-        // 8. Запуск на симуляторе
+        SetRuntimeArgs(program, writer, core, {dst_out_buffer->address(), M_TILES, N_TILES});
         std::cout << "Executing kernel..." << std::endl;
         workload.add_program(device_range, std::move(program));
         distributed::EnqueueMeshWorkload(cq, workload, false);
         distributed::Finish(cq);
-        // 9. Чтение и проверка всех (M_TILES * N_TILES) выходных тайлов
         std::cout << "Reading results from device..." << std::endl;
         std::vector<int32_t> device_result;
         distributed::EnqueueReadMeshBuffer(cq, device_result, dst_out_buffer, true);
