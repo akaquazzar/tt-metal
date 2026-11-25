@@ -5,6 +5,7 @@
 This is a TT-Metalium example that implements BitNet 1.58 ternary-weight inference on
 Blackhole Tensix cores: 2-bit ternary weights are unpacked **on-chip by the SFPU**, fused
 with an Int8×ternary matmul, and the work is distributed across many cores over the NoC.
+A test runner executes a configurable suite of test cases against the same device.
 
 ## What this demo does
 
@@ -19,8 +20,8 @@ For a matrix product `C[M×N] = A[M×K] × W[N×K]ᵀ` expressed in 32×32 tiles
 - Results are written to DRAM as Int32 tiles; the host validates every element against a
   reference matmul computed on the CPU.
 
-All of this is verified end-to-end: `PASS! Arbitrary (M=14, K=64, N=26) BitNet Matmul verified
-across all 364 output tiles!`
+All of this is verified end-to-end: the default suite covers 8 cases, including the target
+multi-core configuration (M=14, K=64, N=26 → 26 cores, all 364 output tiles).
 
 ## Ternary encoding
 
@@ -94,21 +95,49 @@ export ARCH_NAME=blackhole
 
 The compute kernel uses `ckernel_sfpu_custom_ternary_unpack.h`, which is Blackhole-only.
 
-## Configuration
+## Test suite
 
-Matrix dimensions are compile-time constants in `bitnet_unpack_demo.cpp`:
+The binary runs a **suite** of tests, not a single case. Without arguments it runs every
+test; with arguments it runs only the named ones:
 
-```cpp
-constexpr uint32_t M_TILES = 14;  // rows
-constexpr uint32_t K_TILES = 64;  // inner depth; must be a multiple of 16
-constexpr uint32_t N_TILES = 26;  // output columns
+```bash
+# Run everything
+./build/programming_examples/metal_example_bitnet_simple
+
+# Run a subset
+./build/programming_examples/metal_example_bitnet_simple minimal_1x16x1 multicore_14x64x26
 ```
 
-The weight test pattern is selected with:
+Tests are declared in `make_default_test_suite()` in `bitnet_unpack_demo.cpp`:
 
 ```cpp
-const std::string test_pattern = "balanced";
+struct BitnetTestConfig {
+    std::string name;
+    uint32_t m_tiles;
+    uint32_t k_tiles;     // must be a multiple of 16
+    uint32_t n_tiles;
+    std::string pattern;  // sparse | balanced | alternating | all_zeros | all_ones
+    uint32_t seed;
+};
 ```
+
+Add a new test by appending one entry to that list — the runner creates a fresh program,
+kernels and buffers per test, and keeps the device open across the whole suite.
+
+Default suite:
+
+| Test | M×K×N tiles | Purpose |
+|------|-------------|---------|
+| `minimal_1x16x1` | 1×16×1 | Smallest possible case |
+| `small_2x32x3` | 2×32×3 | Quick smoke test |
+| `multicore_14x64x26` | 14×64×26 | Target multi-core scenario (26 cores) |
+| `uneven_split_1x64x200` | 1×64×200 | Uneven split, exercises `core_group_2` |
+| `pattern_all_zeros` | 2×32×3 | Weight pattern coverage |
+| `pattern_all_ones` | 2×32×3 | Weight pattern coverage |
+| `pattern_alternating` | 2×32×3 | Weight pattern coverage |
+| `pattern_sparse` | 2×32×3 | Weight pattern coverage |
+
+### Weight patterns
 
 | Pattern | Description |
 |---------|-------------|
@@ -121,11 +150,15 @@ const std::string test_pattern = "balanced";
 ## Expected output
 
 ```
+Test: multicore_14x64x26 (M=14, K=64, N=26, pattern=balanced)
+Matrix Dimensions (in 32x32 tiles):
+  ...
 Multi-core Work Split:
   - Compute grid:         11 x 10
   - Active cores:         26
   - Max N_tiles per core: 1
   - c_2 per-core size:    65536 bytes
+  - Est. L1 CB usage:     90112 / 1572864 bytes
 
 Setting up circular buffers...
 Creating kernels...
@@ -133,8 +166,15 @@ Uploading input data to device...
 Executing kernel...
 Reading results from device...
 Validating device results against host reference...
-PASS! Arbitrary (M=14, K=64, N=26) BitNet Matmul verified across all 364 output tiles!
+PASS! (14, 64, 26) verified across all 364 output tiles on 26 cores (... ms)
+
+...
+TEST SUMMARY: 8/8 passed
 ```
+
+Each test also prints an up-front estimate of the L1 circular-buffer footprint and fails
+fast (without touching the device) if it would exceed the Blackhole L1 size — this is what
+makes it safe to add larger test configurations.
 
 ## Architecture
 
