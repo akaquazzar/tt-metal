@@ -6,7 +6,8 @@ void kernel_main() {
     const uint32_t act_addr            = get_arg_val<uint32_t>(1);
     const uint32_t M_tiles             = get_arg_val<uint32_t>(2);
     const uint32_t K_tiles             = get_arg_val<uint32_t>(3); // Кратно 16
-    const uint32_t N_tiles             = get_arg_val<uint32_t>(4);
+    const uint32_t core_n_tiles        = get_arg_val<uint32_t>(4); // Сколько столбцов N считает это ядро
+    const uint32_t start_n_tile        = get_arg_val<uint32_t>(5); // Смещение по столбцам N для этого ядра
 
     constexpr uint32_t cb_packed = tt::CBIndex::c_0;
     constexpr uint32_t cb_act    = tt::CBIndex::c_1;
@@ -17,7 +18,8 @@ void kernel_main() {
     constexpr uint32_t batch_size        = 4;
 
     const uint32_t num_k_blocks        = K_tiles / trits_per_word;
-    const uint32_t total_weight_blocks = N_tiles * num_k_blocks;
+    const uint32_t total_weight_blocks = core_n_tiles * num_k_blocks;
+    const uint32_t start_weight_block  = start_n_tile * num_k_blocks;
 
     constexpr auto weights_args = TensorAccessorArgs<0>();
     const auto weights_gen = TensorAccessor(weights_args, packed_weights_addr, packed_tile_bytes);
@@ -26,22 +28,23 @@ void kernel_main() {
     const auto act_gen = TensorAccessor(act_args, act_addr, act_tile_bytes);
 
     // =========================================================================
-    // ПРОХОД 1: Читаем ВСЕ сжатые блоки весов (N_tiles * num_k_blocks)
+    // ПРОХОД 1: Читаем только сжатые веса для среза столбцов этого ядра
     // =========================================================================
     for (uint32_t wb = 0; wb < total_weight_blocks; ++wb) {
         cb_reserve_back(cb_packed, 1);
         uint32_t l1_weights_addr = get_write_ptr(cb_packed);
 
-        noc_async_read(weights_gen.get_noc_addr(wb), l1_weights_addr, packed_tile_bytes);
+        noc_async_read(weights_gen.get_noc_addr(start_weight_block + wb), l1_weights_addr, packed_tile_bytes);
         noc_async_read_barrier();
 
         cb_push_back(cb_packed, 1);
     }
 
     // =========================================================================
-    // ПРОХОД 2: Подаём активации в порядке n (внешний) -> m (внутренний) -> k
+    // ПРОХОД 2: Подаём активации для всех core_n_tiles столбцов этого ядра
+    // в порядке n (внешний) -> m (внутренний) -> k
     // =========================================================================
-    for (uint32_t n = 0; n < N_tiles; ++n) {
+    for (uint32_t n = 0; n < core_n_tiles; ++n) {
         for (uint32_t m = 0; m < M_tiles; ++m) {
             for (uint32_t k = 0; k < K_tiles; k += batch_size) {
                 cb_reserve_back(cb_act, batch_size);

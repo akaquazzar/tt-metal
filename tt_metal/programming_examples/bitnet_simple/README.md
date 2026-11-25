@@ -1,25 +1,58 @@
-# BitNet Simple - Ternary Unpack Kernel Demo (Prototype)
+# BitNet Simple - Ternary Unpack + Matmul Demo
 
-**Status**: Teaching/Demonstration Example
+**Status**: Working prototype / Teaching Example
 
-This is a **prototype/skeleton** demonstrating the structure of a TT-Metal application for ternary quantization. The compute kernel is a placeholder and does not perform actual ternary unpacking (see "Known Limitations" below).
+This is a TT-Metalium example that implements BitNet 1.58 ternary-weight inference on
+Blackhole Tensix cores: 2-bit ternary weights are unpacked **on-chip by the SFPU**, fused
+with an Int8×ternary matmul, and the work is distributed across many cores over the NoC.
 
 ## What this demo does
 
-This example demonstrates the TT-Metal programming model structure:
+For a matrix product `C[M×N] = A[M×K] × W[N×K]ᵀ` expressed in 32×32 tiles:
 
-### Working Components
-- ✅ **Host Application**: Set up devices, kernels, circular buffers
-- ✅ **Dataflow Kernels**: DRAM ↔ L1 data transfer (reader/writer)
-- ✅ **Mock Cluster Simulator**: JIT kernel compilation works correctly
-- ✅ **Validation Infrastructure**: Host-side reference implementation
+- Activations `A` travel as **Int8** tiles (1 KB each), one tile per 32×32 block.
+- Weights `W` travel **packed**: 16 trits per `uint32`, i.e. one 4 KB packed tile expands to
+  16 Int8 tiles (16× compression of the weight transport).
+- The compute kernel **unpacks** packed words into Int8 tiles with the SFPU
+  (`ckernel_sfpu_custom_ternary_unpack.h`) and immediately **multiplies** them by the
+  activations with the FPU (`matmul_tiles`), accumulating in Int32.
+- Results are written to DRAM as Int32 tiles; the host validates every element against a
+  reference matmul computed on the CPU.
 
-### Placeholder Component
-- ⏸️ **Compute Kernel**: Currently just copies data without unpacking (see ternary_unpack.cpp)
+All of this is verified end-to-end: `PASS! Arbitrary (M=14, K=64, N=26) BitNet Matmul verified
+across all 364 output tiles!`
 
-**End-to-end test** will fail with mismatched results until actual SFPU unpacking is implemented.
+## Ternary encoding
 
-## Directory Structure
+```
+2 bits per trit, 16 trits per uint32:
+  00 -> 0
+  01 -> +1
+  10 -> -1
+  11 -> 0
+```
+
+Decoding is branchless on the SFPU: `diff = ((w >> 2k) & 1) - ((w >> 2k+1) & 1)`.
+The value is stored into DEST in the Blackhole integer-FPU sign-magnitude form
+(`diff & 0x80000001`), which the host converts back with `tensix_sm_to_int32`.
+
+## Multi-core scaling
+
+Output columns `N_TILES` are split across the whole compute grid with
+`tt::tt_metal::split_work_to_cores(compute_grid, N_TILES)`. Each core:
+
+1. reads only its slice of packed weight tiles (`start_n_tile * num_k_blocks` onwards),
+2. unpacks all `core_n_tiles * K_TILES` weight tiles into `c_2` in L1,
+3. streams all activations and computes `core_n_tiles` output columns for all `M_TILES` rows,
+4. writes results to the global output index `m * total_N_tiles + (start_n_tile + n)`.
+
+This both removes the single-core L1 limit (the unpacked-weight buffer `c_2` now only needs
+`max_n_tiles_per_core * K_TILES` Int8 tiles instead of `N_TILES * K_TILES`) and parallelizes
+the compute across cores. For `M=14, K=64, N=26` on Blackhole: 26 cores, 1 column per core,
+`c_2` = 64 KB per core — the single-core version would have needed 1.7 MB, above the
+1.5 MB L1 limit.
+
+## Directory structure
 
 ```
 bitnet_simple/
@@ -28,292 +61,119 @@ bitnet_simple/
 ├── README.md                         # This file
 └── kernels/
     ├── compute/
-    │   └── ternary_unpack.cpp        # Compute kernel (unpacking logic)
+    │   └── ternary_unpack.cpp        # SFPU unpacking + FPU matmul (fused)
     └── dataflow/
-        ├── read_packed.cpp           # Reader kernel (DRAM → L1)
-        └── write_unpacked.cpp        # Writer kernel (L1 → DRAM)
+        ├── read_packed.cpp           # Reader kernel (DRAM → L1), per-core N slice
+        └── write_unpacked.cpp        # Writer kernel (L1 → DRAM), global output idx
 ```
 
 ## Building
 
-### Prerequisites
-
 ```bash
-# Ensure you have built tt-metal with all dependencies
-# See: ../../../../INSTALLING.md
-```
-
-### Build the example
-
-```bash
-# From the tt-metal root directory
 cmake -B build -S . -GNinja
-ninja -C build bitnet_unpack_demo
-
-# Or build all programming examples
-ninja -C build bitnet_simple
+ninja -C build metal_example_bitnet_simple
 ```
 
 ## Running
 
-### On Simulator (No Hardware)
+### On simulator (no hardware)
 
 ```bash
-# Enable simulator mode
+export TT_METAL_HOME=~/tt/tt-metal
+export TT_METAL_SIMULATOR=~/tt/sim/libttsim_bh.so
 export ARCH_NAME=blackhole
-export TT_METAL_SIMULATOR=true
-
-# Run the demo
-cd build/programming_examples
-./bitnet_unpack_demo
+TT_METAL_SLOW_DISPATCH_MODE=1 ./build/programming_examples/metal_example_bitnet_simple
 ```
 
-### On Hardware (Tenstorrent Device)
+### On hardware
 
 ```bash
-# Select architecture based on your device
-# For Wormhole:
-export ARCH_NAME=wormhole
-
-# For Blackhole:
 export ARCH_NAME=blackhole
-
-# Run the demo
-cd build/programming_examples
-./bitnet_unpack_demo
+./build/programming_examples/metal_example_bitnet_simple
 ```
 
-## Test Patterns
+The compute kernel uses `ckernel_sfpu_custom_ternary_unpack.h`, which is Blackhole-only.
 
-The demo supports different test patterns via the `test_pattern` variable in `bitnet_unpack_demo.cpp`:
+## Configuration
 
-| Pattern | Description | Typical Use |
-|---------|-------------|-------------|
-| `alternating` | -1, 0, +1, 0, -1, 0, ... | Initial validation |
-| `sparse` | 75% zeros, 12.5% +1, 12.5% -1 | Realistic weight distribution |
-| `balanced` | Equal distribution of -1, 0, +1 | Edge case testing |
-| `all_zeros` | All values = 0 | Performance baseline |
-| `all_ones` | All values = +1 | Edge case testing |
-
-**To change the pattern:**
+Matrix dimensions are compile-time constants in `bitnet_unpack_demo.cpp`:
 
 ```cpp
-// In bitnet_unpack_demo.cpp, line ~187:
-const std::string test_pattern = "sparse";  // Change this
+constexpr uint32_t M_TILES = 14;  // rows
+constexpr uint32_t K_TILES = 64;  // inner depth; must be a multiple of 16
+constexpr uint32_t N_TILES = 26;  // output columns
 ```
 
-## Expected Output
+The weight test pattern is selected with:
+
+```cpp
+const std::string test_pattern = "balanced";
+```
+
+| Pattern | Description |
+|---------|-------------|
+| `alternating` | -1, 0, +1, 0, ... |
+| `sparse` | 75% zeros, 12.5% +1, 12.5% -1 |
+| `balanced` | Equal distribution of -1, 0, +1 |
+| `all_zeros` | All zeros |
+| `all_ones` | All +1 |
+
+## Expected output
 
 ```
-========================================
-BitNet Ternary Unpack Kernel Demo
-========================================
-
-Test Configuration:
-  - Number of tiles:    4
-  - Trits per tile:     1024
-  - Total trits:        4096
-  - Test pattern:       alternating
-
-Generating test data...
-  Packed bytes:        1024
-
-  First 32 trits: [-1, 0, +1, 0, -1, 0, +1, 0, ...]
-
-Creating device...
-  Grid size:           8 x 10
-  Using core:          {0, 0}
+Multi-core Work Split:
+  - Compute grid:         11 x 10
+  - Active cores:         26
+  - Max N_tiles per core: 1
+  - c_2 per-core size:    65536 bytes
 
 Setting up circular buffers...
 Creating kernels...
-  Reader kernel:      read_packed.cpp
-  Writer kernel:      write_unpacked.cpp
-  Compute kernel:     ternary_unpack.cpp
-
 Uploading input data to device...
-
 Executing kernel...
-
 Reading results from device...
-
-Validating results against host reference...
-
-========================================
-✓ Test PASSED
-========================================
-```
-
-## Ternary Encoding
-
-### Packed Format
-
-```
-Byte representation:
-  Bits 7-6: Trit 3
-  Bits 5-4: Trit 2
-  Bits 3-2: Trit 1
-  Bits 1-0: Trit 0
-
-Decoding:
-  00 -> -1.0
-  01 ->  0.0
-  10 ->  0.0
-  11 -> +1.0
-```
-
-### Example
-
-```c
-// Packed byte: 0b10011010
-// Breakdown:
-//   Bits 1-0: 10 -> 0.0  (Trit 0)
-//   Bits 3-2: 11 -> +1.0 (Trit 1)
-//   Bits 5-4: 01 -> 0.0  (Trit 2)
-//   Bits 7-6: 10 -> 0.0  (Trit 3)
-// Result: [0.0, +1.0, 0.0, 0.0]
+Validating device results against host reference...
+PASS! Arbitrary (M=14, K=64, N=26) BitNet Matmul verified across all 364 output tiles!
 ```
 
 ## Architecture
 
-### Data Flow
-
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Host (CPU)                               │
-└─────────────────┬───────────────────────────────────────────┘
-                  │ PCIe/NoC
-                  ↓
-┌─────────────────────────────────────────────────────────────┐
-│                  Tensix Core ({0, 0})                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                                │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ Reader Kernel │    │ Compute Kernel│    │ Writer Kernel│  │
-│  │  (RISC 0)    │    │ (Compute)     │    │  (RISC 1)    │  │
-│  │              │    │               │    │              │  │
-│  │ DRAM → CB    │──→ │  Unpack       │──→ │  CB → DRAM   │  │
-│  │    packed    │    │  Ternary      │    │  unpacked    │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│       │                    │                    │           │
-│       ↓                    ↓                    ↓           │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ NoC R0       │    │  L1 (SRAM)   │    │  NoC R1      │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                                │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│                        Host (CPU)                                  │
+│  split_work_to_cores → per-core runtime args; validates all tiles  │
+└──────────────────────────────┬─────────────────────────────────────┘
+                               │ PCIe
+                               ↓
+┌───────────────────────────────┬────────────────────────────────────┐
+│  Tensix core k (of num_cores) │  ... (one per N-column slice)      │
+├───────────────────────────────┼────────────────────────────────────┤
+│ Reader (RISC0) → c_0 packed   │ Compute: SFPU unpack → c_2 → FPU   │
+│ Reader (RISC0) → c_1 activ.   │ matmul → c_16 Int32                │
+│                               │ Writer (RISC1): c_16 → DRAM        │
+└───────────────────────────────┴────────────────────────────────────┘
 ```
 
-### Kernel Responsibilities
-
-| Kernel | Purpose | Key Operations |
+| Kernel | Purpose | Key operations |
 |--------|---------|----------------|
-| `read_packed.cpp` | Read packed data from DRAM | `noc_async_read_page`, `cb_push_back` |
-| `ternary_unpack.cpp` | Decode 2-bit trits to float | `extract bits`, `decode to float16` |
-| `write_unpacked.cpp` | Write result back to DRAM | `noc_async_write_page`, `cb_pop_front` |
+| `read_packed.cpp` | DRAM → L1: own weight slice + activations | `noc_async_read`, `cb_push_back` |
+| `ternary_unpack.cpp` | SFPU unpack 16 trits/word + FPU matmul | `copy_tile`, `unpack_row_batch`, `matmul_tiles`, `pack_tile` |
+| `write_unpacked.cpp` | L1 → DRAM at global tile index | `noc_async_write`, `cb_pop_front` |
 
-## Known Limitations
+## Known limitations
 
-This is a **teaching example** that demonstrates TT-Metal API usage, but has the following limitations:
-
-1. **No Actual Unpacking**: The compute kernel (`ternary_unpack.cpp`) is a placeholder that simply copies data. Real implementation would:
-   - Extract 2 bits from packed uint8_t
-   - Decode to ternary values: 00→-1, 01→0, 10→0, 11→+1
-   - Convert to float16/bfloat16 format
-
-2. **No SFPU Vectorization**: Production implementation should use SFPU (Single-Instruction Multiple-Data Floating Point Unit) operations:
-   ```cpp
-   #include "experimental/llk_sfpu/ckernel_sfpu_custom_ternary_unpack.h"
-   // Custom SFPU implementation needed
-   ```
-
-3. **Test Will Fail**: The end-to-end test reports mismatches because data is not actually unpacked. This is **expected behavior** for this prototype.
-
-4. **Single Core Only**: Uses only core {0, 0}. Production would distribute work across multiple Tensix cores.
-
-## What This Example Demonstrates
-
-Despite limitations, this example shows:
-
-✓ TT-Metal application structure
-✓ Dataflow kernel patterns (reader/writer)
-✓ Circular buffer configuration (different data formats)
-✓ Kernel compilation with RISC-V compiler (JIT)
-✓ Mock cluster simulator usage
-✓ TensorAccessorArgs for buffer addressing
-✓ Host-side validation infrastructure
-✓ Tile-based data flow (32×32 tiles)
-
-## Future Enhancements
-
-For a production-ready BitNet implementation:
-
-### 1. SFPU Unpacking (Required)
-```cpp
-// In tt_metal/experimental/llk_sfpu/:
-// Add: ckernel_sfpu_custom_ternary_unpack.h
-
-inline void unpack_ternary_tile(uint32_t dst) {
-    // Load 32-bit words (16 trits each)
-    // Extract 2 bits per trit
-    // Decode: 00→-1, 01/10→0, 11→+1
-    // Scale to float16 range
-    // Store to destination tile
-}
-```
-
-### 2. Multi-Core Scaling
-```cpp
-auto cores = corerange.x_size() * corerange.y_size();
-split_work_to_cores(cores, num_tiles, work_per_core);
-// Distribute tile processing across multiple Tensix cores
-```
-
-### 3. Fused Operations
-- Combine unpacking with accumulation matrix multiplication
-- Skip DRAM round-trip for intermediate results
-
-### 4. Sparse Optimization
-- Detect zero-run patterns (75% typical in BitNet weights)
-- Skip computation for zero tiles
-
-## Troubleshooting
-
-### Build Errors
-
-```bash
-# Make sure dependencies are installed
-./install_dependencies.sh
-
-# Clean rebuild
-rm -rf build
-cmake -B build -S . -GNinja
-ninja -C build bitnet_unpack_demo
-```
-
-### Runtime Errors
-
-```bash
-# Check simulator setup
-echo $ARCH_NAME  # Should be blackhole or wormhole
-echo $TT_METAL_SIMULATOR  # Should be "true" for simulator
-
-# Check for device
-lspci | grep Tenstorrent
-```
-
-### Performance Issues
-
-This demo focuses on correctness, not performance. For production:
-- Tile-sized operations (already implemented)
-- Double buffering in circular buffers
-- Optimize memory layout for DRAM bandwidth
+1. **Blackhole-only**: the custom SFPU unpack header exists only for Blackhole
+   (`tt_metal/hw/ckernels/blackhole/...`); there is no Wormhole counterpart.
+2. **Unpack buffer is fully materialized in L1**: `c_2` holds all `core_n_tiles * K_TILES`
+   unpacked weight tiles at once. This is what makes the multi-core split necessary —
+   and it caps `N_TILES / num_cores` relative to L1 size.
+3. **Activations are re-read per output column**: the reader streams `A` once per
+   `core_n_tiles`; a future optimization could cache them or multicast.
+4. **Debug build path**: the example is run via `TT_METAL_SLOW_DISPATCH_MODE=1` on the
+   simulator; performance is not tuned.
 
 ## References
 
 - [TT-Metalium Guide](../../../../METALIUM_GUIDE.md)
 - [Programming Examples](../)
-- [LLMs in TT-NN](../../../../tech_reports/LLMs/llms.md) - For context on why ternary encoding matters
-
-## Contributing
-
-This is an educational example. For production contributions, see the main TT-Metal repository.
+- [LLMs in TT-NN](../../../../tech_reports/LLMs/llms.md)

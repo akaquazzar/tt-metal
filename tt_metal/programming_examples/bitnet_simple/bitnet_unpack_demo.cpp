@@ -3,6 +3,7 @@
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/device.hpp>
 #include <tt-metalium/tensor_accessor_args.hpp>
+#include <tt-metalium/work_split.hpp>
 #include <tt-metalium/distributed.hpp>
 
 #include <cstddef>
@@ -147,9 +148,9 @@ int main() {
         constexpr uint32_t TILE_SIZE = tt::constants::TILE_WIDTH * tt::constants::TILE_HEIGHT;  // 1024
         constexpr uint32_t TRITS_PER_WORD = 16;
 
-        constexpr uint32_t M_TILES = 2;   // Например, 64 токена (Prefill); для Decode ставим 1
-        constexpr uint32_t K_TILES = 32;  // Должно быть кратно 16 (например, K = 1024)
-        constexpr uint32_t N_TILES = 3;   // Например, ширина выхода N = 96
+        constexpr uint32_t M_TILES = 14;  // Например, 448 токенов; для Decode ставим 1
+        constexpr uint32_t K_TILES = 64;  // Должно быть кратно 16 (например, K = 2048)
+        constexpr uint32_t N_TILES = 26;  // Например, ширина выхода N = 832
 
         static_assert(K_TILES % TRITS_PER_WORD == 0, "K_TILES must be a multiple of 16");
 
@@ -212,8 +213,6 @@ int main() {
         distributed::MeshCoordinateRange device_range = distributed::MeshCoordinateRange(mesh_device->shape());
         Program program = CreateProgram(*mesh_device);
 
-        constexpr CoreCoord core = {0, 0};
-
         // 4. Выделение DRAM буферов строго под вычисленные размеры
         constexpr uint32_t packed_tile_size = TILE_SIZE * sizeof(uint32_t);  // 4096 байт
         constexpr uint32_t int8_tile_size = TILE_SIZE * sizeof(int8_t);      // 1024 байта
@@ -235,31 +234,49 @@ int main() {
             mesh_device.get());
 
         // 5. Circular Buffers в L1 SRAM
+        // 1. Делим выходные столбцы N_TILES по сетке ядер Blackhole
+        auto compute_grid = mesh_device->compute_with_storage_grid_size();
+        auto [num_cores, all_cores, core_group_1, core_group_2, n_tiles_group_1, n_tiles_group_2] =
+            tt::tt_metal::split_work_to_cores(compute_grid, N_TILES);
+
+        // Максимальное число столбцов на одно ядро (определяет размер буфера c_2 в L1!)
+        const uint32_t max_n_tiles_per_core = std::max(n_tiles_group_1, n_tiles_group_2);
+
+        std::cout << "Multi-core Work Split:" << std::endl;
+        std::cout << "  - Compute grid:         " << compute_grid.x << " x " << compute_grid.y << std::endl;
+        std::cout << "  - Active cores:         " << num_cores << std::endl;
+        std::cout << "  - Max N_tiles per core: " << max_n_tiles_per_core << std::endl;
+        std::cout << "  - c_2 per-core size:    " << max_n_tiles_per_core * K_TILES * int8_tile_size << " bytes"
+                  << std::endl << std::endl;
+
+        // 2. Circular Buffers выделяются на all_cores, а размер c_2 зависит только от max_n_tiles_per_core!
         std::cout << "Setting up circular buffers..." << std::endl;
         CreateCircularBuffer(
             program,
-            core,
+            all_cores,
             CircularBufferConfig(2 * packed_tile_size, {{tt::CBIndex::c_0, tt::DataFormat::UInt32}})
                 .set_page_size(tt::CBIndex::c_0, packed_tile_size));
 
         CreateCircularBuffer(
             program,
-            core,
+            all_cores,
             CircularBufferConfig(8 * int8_tile_size, {{tt::CBIndex::c_1, tt::DataFormat::Int8}})
                 .set_page_size(tt::CBIndex::c_1, int8_tile_size));
 
         CreateCircularBuffer(
             program,
-            core,
-            CircularBufferConfig(N_TILES * K_TILES * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
+            all_cores,
+            CircularBufferConfig(
+                max_n_tiles_per_core * K_TILES * int8_tile_size, {{tt::CBIndex::c_2, tt::DataFormat::Int8}})
                 .set_page_size(tt::CBIndex::c_2, int8_tile_size));
 
         CreateCircularBuffer(
             program,
-            core,
+            all_cores,
             CircularBufferConfig(2 * int32_tile_size, {{tt::CBIndex::c_16, tt::DataFormat::Int32}})
                 .set_page_size(tt::CBIndex::c_16, int32_tile_size));
 
+        // 3. Создание ядер на all_cores
         std::cout << "Creating kernels..." << std::endl;
         std::vector<uint32_t> reader_compile_time_args;
         TensorAccessorArgs(*src_packed_buffer).append_to(reader_compile_time_args);
@@ -268,7 +285,7 @@ int main() {
         auto reader = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "bitnet_simple/kernels/dataflow/read_packed.cpp",
-            core,
+            all_cores,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_0,
                 .noc = NOC::RISCV_0_default,
@@ -280,7 +297,7 @@ int main() {
         auto writer = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "bitnet_simple/kernels/dataflow/write_unpacked.cpp",
-            core,
+            all_cores,
             DataMovementConfig{
                 .processor = DataMovementProcessor::RISCV_1,
                 .noc = NOC::RISCV_1_default,
@@ -289,21 +306,45 @@ int main() {
         auto compute = CreateKernel(
             program,
             OVERRIDE_KERNEL_PREFIX "bitnet_simple/kernels/compute/ternary_unpack.cpp",
-            core,
+            all_cores,
             ComputeConfig{.fp32_dest_acc_en = true, .dst_full_sync_en = true});
 
-        // 7. Передача данных и runtime-аргументов (M_TILES, K_TILES, N_TILES)
+        // 4. Раздаём индивидуальные RuntimeArgs каждому активному ядру
+        auto cores = corerange_to_cores(all_cores, num_cores, /*row_wise=*/true);
+        uint32_t current_n_offset = 0;
+
+        for (const auto& core : cores) {
+            uint32_t core_n_tiles = 0;
+            if (core_group_1.contains(core)) {
+                core_n_tiles = n_tiles_group_1;
+            } else if (core_group_2.contains(core)) {
+                core_n_tiles = n_tiles_group_2;
+            } else {
+                TT_THROW("Core not in any work group!");
+            }
+
+            SetRuntimeArgs(
+                program,
+                reader,
+                core,
+                {src_packed_buffer->address(),
+                 src_act_buffer->address(),
+                 M_TILES,
+                 K_TILES,
+                 core_n_tiles,
+                 current_n_offset});
+            SetRuntimeArgs(program, compute, core, {M_TILES, K_TILES, core_n_tiles});
+            SetRuntimeArgs(
+                program, writer, core, {dst_out_buffer->address(), M_TILES, core_n_tiles, current_n_offset, N_TILES});
+
+            current_n_offset += core_n_tiles;
+        }
+
+        // 7. Передача данных на устройство
         std::cout << "Uploading input data to device..." << std::endl;
         distributed::EnqueueWriteMeshBuffer(cq, src_packed_buffer, packed_weights, false);
         distributed::EnqueueWriteMeshBuffer(cq, src_act_buffer, activations, false);
 
-        SetRuntimeArgs(
-            program,
-            reader,
-            core,
-            {src_packed_buffer->address(), src_act_buffer->address(), M_TILES, K_TILES, N_TILES});
-        SetRuntimeArgs(program, compute, core, {M_TILES, K_TILES, N_TILES});
-        SetRuntimeArgs(program, writer, core, {dst_out_buffer->address(), M_TILES, N_TILES});
         std::cout << "Executing kernel..." << std::endl;
         workload.add_program(device_range, std::move(program));
         distributed::EnqueueMeshWorkload(cq, workload, false);
